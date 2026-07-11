@@ -432,22 +432,42 @@ void TaskRawSampler(void *pvParameters) {
     Serial.printf("[Raw] GPIO sampler on pin %d ready\n", RS485_RX_PIN);
 
     for (;;) {
-        // ── 1. Wait for falling edge (start bit) with 3s timeout ─────────
-        pinMode(RS485_RX_PIN, INPUT);  // ensure GPIO mode while waiting
-        uint32_t wait_start = millis();
-        bool got_edge = false;
-        while (millis() - wait_start < 3000) {
-#if RS485_INVERTED
-            if (digitalRead(RS485_RX_PIN) == HIGH) { got_edge = true; break; } // inverted: idle=LOW, start=HIGH
-#else
-            if (digitalRead(RS485_RX_PIN) == LOW)  { got_edge = true; break; } // normal:   idle=HIGH, start=LOW
-#endif
+        // ── 1. Trigger: first falling edge AFTER ≥100ms of silence ───────
+        // Bus pattern: burst <100ms, idle ~900ms. Waiting for silence first
+        // ensures we always start at the true beginning of a packet, not
+        // mid-burst. This also eliminates the 40m-cable reflection problem
+        // (reflections only occur during active transmission, not at start).
+        pinMode(RS485_RX_PIN, INPUT);
+
+        // Phase A: wait until line has been HIGH for ≥100ms continuously
+        uint32_t high_since = millis();
+        uint32_t phase_start = millis();
+        bool got_silence = false;
+        while (millis() - phase_start < 5000) {
+            if (digitalRead(RS485_RX_PIN) == LOW) {
+                high_since = millis();  // reset on any activity
+            } else if (millis() - high_since >= 100) {
+                got_silence = true;
+                break;
+            }
             taskYIELD();
         }
-
-        if (!got_edge) {
-            Serial.println("[Raw] No edge in 3s. Check: A/B polarity? RE/DE pin grounded? Vcc?");
+        if (!got_silence) {
+            Serial.println("[Raw] No 100ms silence in 5s — bus always busy or line stuck LOW");
             vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Phase B: wait for first falling edge (start bit of new burst)
+        bool got_edge = false;
+        uint32_t wait_start = millis();
+        while (millis() - wait_start < 3000) {
+            if (digitalRead(RS485_RX_PIN) == LOW) { got_edge = true; break; }
+            taskYIELD();
+        }
+        if (!got_edge) {
+            Serial.println("[Raw] No edge after silence — check wiring");
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
