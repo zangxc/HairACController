@@ -29,9 +29,9 @@ struct RS485Config {
 };
 
 static const RS485Config rs485_configs[] = {
+    { 9600, SERIAL_8E1, "8E1", "9600 8E1 (even parity, 1 stop) ← prime candidate"  },
     { 9600, SERIAL_8N1, "8N1", "9600 8N1 (no parity, 1 stop)"    },
     { 9600, SERIAL_8N2, "8N2", "9600 8N2 (no parity, 2 stop)"    },
-    { 9600, SERIAL_8E1, "8E1", "9600 8E1 (even parity, 1 stop)"  },
     { 9600, SERIAL_8E2, "8E2", "9600 8E2 (even parity, 2 stop)"  },
     { 9600, SERIAL_8O1, "8O1", "9600 8O1 (odd parity,  1 stop)"  },
     { 9600, SERIAL_8O2, "8O2", "9600 8O2 (odd parity,  2 stop)"  },
@@ -540,16 +540,25 @@ void TaskRawSampler(void *pvParameters) {
         }
 
         // ── 5. Estimate bit period ────────────────────────────────────────
-        if (min_run <  50) min_run = 104;  // sub-50µs = glitch, floor at 9600 baud
-        if (min_run > 500) min_run = 104;  // >500µs = below 2000 baud, unexpected
-        g_sniffer.raw_bit_us = min_run;
-        uint32_t baud_est = 1000000UL / min_run;
-        Serial.printf("  bit=%luus  baud~%lu  runs=%lu  min=%luus  max=%luus\n",
+        // Baud is confirmed 9600 by logic analyser (104µs/bit).
+        // On a 40m cable, reflections corrupt edge timing on short bursts,
+        // making the raw minimum unreliable. Snap to nearest standard baud.
+        uint32_t baud_est = 1000000UL / (min_run > 0 ? min_run : 104);
+        // Snap table: measured → actual
+        uint32_t snapped_baud;
+        if      (baud_est > 7000 && baud_est < 11000) snapped_baud = 9600;
+        else if (baud_est > 11000 && baud_est < 14000) snapped_baud = 12000; // shouldn't occur
+        else if (baud_est > 14000 && baud_est < 20000) snapped_baud = 9600;  // reflection artefact → still 9600
+        else if (baud_est > 3500 && baud_est < 5500)   snapped_baud = 4800;
+        else snapped_baud = 9600; // default fallback
+        uint32_t bit_us_snapped = 1000000UL / snapped_baud;
+        g_sniffer.raw_bit_us = bit_us_snapped;
+        Serial.printf("  raw_min=%luus(~%lubaud) -> snapped to %lubaud (%luus/bit)\n",
             (unsigned long)min_run, (unsigned long)baud_est,
-            (unsigned long)run_cnt, (unsigned long)min_run, (unsigned long)max_run);
+            (unsigned long)snapped_baud, (unsigned long)bit_us_snapped);
 
         // ── 6. Soft-decode UART frames ────────────────────────────────────
-        int  spb  = (int)(min_run / RAW_SAMPLE_RATE_US);  // samples per bit (~10)
+        int  spb  = (int)(bit_us_snapped / RAW_SAMPLE_RATE_US);  // samples per bit (9600→10)
         if (spb < 1) spb = 1;
         int  half = spb / 2;
         int  frames = 0;
