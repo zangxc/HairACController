@@ -2,23 +2,21 @@
 #include <esp_display_panel.hpp>
 #include <lvgl.h>
 #include "lvgl_v8_port.h"
+#include "driver/uart.h"   // for uart_set_line_inverse / UART_SIGNAL_RXD_INV
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
 
 // ==================== 1. RS485 Sniffer Configuration ====================
-// Pins 43 (TX) and 44 (RX) are free on Waveshare ESP32-S3-Touch-LCD-4.3B
-// GPIO4 = touch INT, GPIO5 = LCD RGB DE — do NOT use those.
 #define ENABLE_RS485_SNIFFER   1
-#define RS485_RX_PIN           44
-#define RS485_TX_PIN           43
-// No DE/RTS pin needed: we are receive-only sniffer, pulled LOW by transceiver
-// If your module has an RE/DE pin, wire it to GND permanently for pure RX mode.
+#define RS485_RX_PIN           43   // GPIO43 = RS485_RXD per Waveshare schematic
+#define RS485_TX_PIN           44   // GPIO44 = RS485_TXD per Waveshare schematic
 
-// Self-test: uses Serial2 to loop TX→RX on the same UART pair so we can
-// verify capture logic before the hardware is even wired to the bus.
-// Set to 1 to enable loopback self-test (connect pin 43 to pin 44 with a wire).
-#define RS485_SELF_TEST        1
+// Set to 1 if the line sits LOW at idle (A/B wires swapped).
+// The raw sampler will invert its GPIO reads, and the UART will use
+// hardware RX inversion so you don't need to physically swap wires.
+// Start with 0; if raw output shows L60000 (always LOW), set to 1.
+#define RS485_INVERTED         0
 
 // ==================== 2. RS485 Config Table ====================
 // Baud is confirmed 9600 via logic analyser (104µs bit period).
@@ -439,7 +437,11 @@ void TaskRawSampler(void *pvParameters) {
         uint32_t wait_start = millis();
         bool got_edge = false;
         while (millis() - wait_start < 3000) {
-            if (digitalRead(RS485_RX_PIN) == LOW) { got_edge = true; break; }
+#if RS485_INVERTED
+            if (digitalRead(RS485_RX_PIN) == HIGH) { got_edge = true; break; } // inverted: idle=LOW, start=HIGH
+#else
+            if (digitalRead(RS485_RX_PIN) == LOW)  { got_edge = true; break; } // normal:   idle=HIGH, start=LOW
+#endif
             taskYIELD();
         }
 
@@ -462,7 +464,11 @@ void TaskRawSampler(void *pvParameters) {
         uint64_t t_next = t0;
         while (n < RAW_MAX_SAMPLES) {
             while ((int64_t)(esp_timer_get_time() - t_next) < 0) {}  // busy-wait
+#if RS485_INVERTED
+            raw_buf[n] = (uint8_t)(digitalRead(RS485_RX_PIN) ^ 1);  // flip: HIGH=0, LOW=1
+#else
             raw_buf[n] = (uint8_t)digitalRead(RS485_RX_PIN);
+#endif
             raw_ts[n]  = (uint32_t)(esp_timer_get_time() - t0);
             t_next += RAW_SAMPLE_RATE_US;
             n++;
@@ -498,11 +504,16 @@ void TaskRawSampler(void *pvParameters) {
         if (lpos > 2) Serial.println(line);
 
         if (!any_low) {
-            Serial.println("  *** Line stayed HIGH the entire 60ms ***");
-            Serial.println("  Possible causes:");
-            Serial.println("    1. RS485 A/B swapped — try swapping the two wires");
-            Serial.println("    2. RE/DE pin not pulled LOW (enable receive mode)");
-            Serial.println("    3. Pin 44 not connected to module RO pin");
+            Serial.println("  *** No signal transitions in 60ms capture ***");
+#if RS485_INVERTED
+            Serial.println("  RS485_INVERTED=1: idle=LOW expected, got all HIGH.");
+            Serial.println("  -> Try RS485_INVERTED=0 (standard polarity)");
+#else
+            Serial.println("  RS485_INVERTED=0: idle=HIGH expected, got all LOW.");
+            Serial.println("  -> Try RS485_INVERTED=1 (swap A/B in software)");
+            Serial.println("  -> Or physically swap A and B wires on RS485 module");
+#endif
+            Serial.println("  Also check: RE/DE pin LOW? Module Vcc? Pin 44 connected?");
             g_sniffer.raw_bit_us = 0;
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
@@ -599,6 +610,10 @@ void TaskRS485Sniffer(void *pvParameters) {
         Serial1.begin(rs485_configs[cfg_idx].baud,
                       rs485_configs[cfg_idx].serial_cfg,
                       RS485_RX_PIN, -1);
+#if RS485_INVERTED
+        // Hardware RX signal inversion — no need to physically swap A/B wires
+        uart_set_line_inverse(1, UART_SIGNAL_RXD_INV);
+#endif
         uart_open = true;
     };
     auto close_uart = [&]() {
