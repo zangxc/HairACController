@@ -21,42 +21,41 @@ using namespace esp_panel::board;
 #define RS485_SELF_TEST        1
 
 // ==================== 2. RS485 Config Table ====================
-// Covers all common AC controller protocols (Daikin, Mitsubishi, Haier, etc.)
+// Baud is confirmed 9600 via logic analyser (104µs bit period).
+// Exhaust all parity/stop-bit combos at 9600 only.
 struct RS485Config {
     uint32_t    baud;
-    uint32_t    serial_cfg;   // Arduino SERIAL_8x1 constant
-    const char* label;        // short label for on-screen display
-    const char* desc;         // verbose label for serial monitor
+    uint32_t    serial_cfg;
+    const char* label;
+    const char* desc;
 };
 
 static const RS485Config rs485_configs[] = {
-    { 9600,  SERIAL_8N1, "9600-8N1",  "9600 baud 8N1 (no parity)"          },
-    { 9600,  SERIAL_8E1, "9600-8E1",  "9600 baud 8E1 (even - Haier/Gree)"  },
-    { 9600,  SERIAL_8O1, "9600-8O1",  "9600 baud 8O1 (odd)"                },
-    { 4800,  SERIAL_8N1, "4800-8N1",  "4800 baud 8N1"                       },
-    { 4800,  SERIAL_8E1, "4800-8E1",  "4800 baud 8E1 (even)"               },
-    { 19200, SERIAL_8N1, "19200-8N1", "19200 baud 8N1"                      },
-    { 19200, SERIAL_8E1, "19200-8E1", "19200 baud 8E1 (even - Daikin)"      },
-    { 38400, SERIAL_8N1, "38400-8N1", "38400 baud 8N1"                      },
-    { 38400, SERIAL_8E1, "38400-8E1", "38400 baud 8E1"                      },
-    { 2400,  SERIAL_8E1, "2400-8E1",  "2400 baud 8E1 (slow legacy)"         },
+    { 9600, SERIAL_8N1, "8N1", "9600 8N1 (no parity, 1 stop)"    },
+    { 9600, SERIAL_8N2, "8N2", "9600 8N2 (no parity, 2 stop)"    },
+    { 9600, SERIAL_8E1, "8E1", "9600 8E1 (even parity, 1 stop)"  },
+    { 9600, SERIAL_8E2, "8E2", "9600 8E2 (even parity, 2 stop)"  },
+    { 9600, SERIAL_8O1, "8O1", "9600 8O1 (odd parity,  1 stop)"  },
+    { 9600, SERIAL_8O2, "8O2", "9600 8O2 (odd parity,  2 stop)"  },
 };
 static const int RS485_NUM_CONFIGS = sizeof(rs485_configs) / sizeof(rs485_configs[0]);
-static const uint32_t SCAN_INTERVAL_MS = 6000; // ms per config slot
+static const uint32_t SCAN_INTERVAL_MS = 8000; // 8 s per config (bus is ~1 msg/s)
 
-// ==================== 3. Shared Sniffer State (task → UI) ====================
-// Written by sniffer FreeRTOS task, read by LVGL timer — using volatile +
-// simple byte-aligned types so reads are atomic enough for a status display.
+// ==================== 3. Shared State (tasks → UI) ====================
 struct SnifferStatus {
-    volatile int     cfg_idx;          // current config index
-    volatile uint32_t bytes_total;     // total raw bytes seen this slot
-    volatile uint32_t pkts_valid;      // packets that passed heuristic
-    volatile uint32_t pkts_invalid;    // packets that failed heuristic
-    volatile uint32_t slots_scanned;   // how many config slots completed
-    volatile bool    self_test_ok;     // did self-test TX→RX loop pass?
-    char             status_line[64];  // human-readable, set by sniffer task
+    volatile int      cfg_idx;
+    volatile uint32_t bytes_total;
+    volatile uint32_t pkts_valid;
+    volatile uint32_t pkts_invalid;
+    volatile uint32_t slots_scanned;
+    volatile bool     self_test_ok;
+    // Raw sampler fields — written by sampler task
+    volatile uint32_t raw_captures;   // how many triggered captures done
+    volatile uint32_t raw_bit_us;     // last measured bit period in µs
+    volatile uint8_t  raw_frame_bits; // last decoded frame: bit count hint (8 or 9)
+    char              status_line[80];
 };
-static SnifferStatus g_sniffer = {0, 0, 0, 0, 0, false, "Initialising..."};
+static SnifferStatus g_sniffer = {};
 
 // ==================== 4. Central AC State ====================
 bool ac_master_power  = true;
@@ -200,40 +199,31 @@ static void refresh_air_con_ui(void) {
 static void sniffer_status_timer_cb(lv_timer_t *timer) {
     if (!lbl_sniffer_bar) return;
 
-    // Snapshot volatile fields (no mutex needed — single-byte or word reads)
-    int   idx   = g_sniffer.cfg_idx;
+    int      idx     = g_sniffer.cfg_idx;
     if (idx < 0 || idx >= RS485_NUM_CONFIGS) idx = 0;
-
     uint32_t valid   = g_sniffer.pkts_valid;
     uint32_t invalid = g_sniffer.pkts_invalid;
-    uint32_t bytes   = g_sniffer.bytes_total;
-    bool     st_ok   = g_sniffer.self_test_ok;
-
-#if RS485_SELF_TEST
-    // Show self-test result prominently until real traffic arrives
-    if (bytes == 0) {
-        lv_label_set_text_fmt(lbl_sniffer_bar,
-            "SELF-TEST: %s | waiting…",
-            st_ok ? "PASS" : "pending");
-        lv_obj_set_style_text_color(lbl_sniffer_bar,
-            st_ok ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_YELLOW), 0);
-        return;
-    }
-#endif
+    uint32_t caps    = g_sniffer.raw_captures;
+    uint32_t bit_us  = g_sniffer.raw_bit_us;
 
     const char *lbl = rs485_configs[idx].label;
-    lv_label_set_text_fmt(lbl_sniffer_bar,
-        "%s | B:%lu V:%lu I:%lu",
-        lbl, (unsigned long)bytes,
-        (unsigned long)valid, (unsigned long)invalid);
 
-    // Color: green = got valid pkts, orange = data but invalid, grey = no data
-    if (valid > 0)
-        lv_obj_set_style_text_color(lbl_sniffer_bar, lv_palette_main(LV_PALETTE_GREEN), 0);
-    else if (bytes > 0)
-        lv_obj_set_style_text_color(lbl_sniffer_bar, lv_palette_main(LV_PALETTE_ORANGE), 0);
-    else
+    if (caps == 0) {
+        lv_label_set_text_fmt(lbl_sniffer_bar,
+            "UART:%s V:%lu I:%lu | RAW: waiting...",
+            lbl, (unsigned long)valid, (unsigned long)invalid);
         lv_obj_set_style_text_color(lbl_sniffer_bar, COLOR_TEXT_MUTED, 0);
+    } else {
+        lv_label_set_text_fmt(lbl_sniffer_bar,
+            "UART:%s V:%lu I:%lu | RAW:%luus(%lubaud) #%lu",
+            lbl,
+            (unsigned long)valid, (unsigned long)invalid,
+            (unsigned long)bit_us,
+            bit_us > 0 ? (unsigned long)(1000000UL / bit_us) : 0UL,
+            (unsigned long)caps);
+        lv_obj_set_style_text_color(lbl_sniffer_bar,
+            valid > 0 ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_ORANGE), 0);
+    }
 }
 
 // ==================== 10. Main Dashboard UI Build ====================
@@ -368,159 +358,326 @@ void create_air_con_dashboard(void) {
 }
 
 // ==================== 11. Packet Validation Heuristic ====================
-// A "packet" is a burst of bytes separated by a silence gap of >5 ms.
-// Valid if: length >= 3, first byte repeats across multiple packets (master address),
-// or last byte could be a checksum (XOR/sum of prior bytes ≈ last byte).
+// Gap-based framing: silence > PKT_GAP_MS after last byte = packet boundary.
+// PKT_GAP_MS must be >> one byte time at the current baud:
+//   9600 baud  → 1 byte ≈ 1.04 ms → gap 30 ms is safe
+//   4800 baud  → 1 byte ≈ 2.08 ms → gap 30 ms is safe
+//   38400 baud → 1 byte ≈ 0.26 ms → gap 30 ms is safe
+// 30 ms covers even protocols that stretch inter-byte gaps to ~3-4 ms.
+static const uint32_t PKT_GAP_MS = 30;
+
+// Framing noise filter: RS485 idle line can produce 0x00 or 0xFF framing
+// error bytes at wrong baud/parity. Skip lone 0x00/0xFF before reassembling.
+static inline bool is_framing_noise(const uint8_t *buf, int len) {
+    if (len > 2) return false; // real packet, not noise
+    for (int i = 0; i < len; i++)
+        if (buf[i] != 0x00 && buf[i] != 0xFF) return false;
+    return true; // all bytes are 0x00 or 0xFF → likely framing error on idle line
+}
+
 static bool validate_packet(const uint8_t *buf, int len) {
     if (len < 3) return false;
-    // Heuristic 1: XOR checksum of all bytes except last == last byte
+    if (is_framing_noise(buf, len)) return false;
+
+    // H1: XOR of all bytes (including last) == 0  (common in HVAC)
+    uint8_t xor_all = 0;
+    for (int i = 0; i < len; i++) xor_all ^= buf[i];
+    if (xor_all == 0x00) return true;
+
+    // H2: XOR checksum — XOR of bytes[0..n-2] == bytes[n-1]
     uint8_t xor_sum = 0;
     for (int i = 0; i < len - 1; i++) xor_sum ^= buf[i];
     if (xor_sum == buf[len - 1]) return true;
-    // Heuristic 2: arithmetic sum (low byte) of all bytes except last == last byte
+
+    // H3: Arithmetic sum (low byte) of bytes[0..n-2] == bytes[n-1]
     uint8_t arith_sum = 0;
     for (int i = 0; i < len - 1; i++) arith_sum += buf[i];
     if (arith_sum == buf[len - 1]) return true;
-    // Heuristic 3: reasonable length (4–32 bytes) with non-all-zero content
-    if (len >= 4 && len <= 32) {
-        bool all_zero = true;
-        for (int i = 0; i < len; i++) if (buf[i] != 0) { all_zero = false; break; }
-        if (!all_zero) return true;
+
+    // H4: Arithmetic sum + 1 (Mitsubishi/some Daikin variants)
+    if ((uint8_t)(arith_sum + 1) == buf[len - 1]) return true;
+
+    // H5: Packet is plausible length (4–48 bytes) AND has structural byte variation
+    // (not all identical, not random noise = some bytes repeat like address fields)
+    if (len >= 4 && len <= 48) {
+        int unique = 0;
+        uint8_t seen[256] = {0};
+        for (int i = 0; i < len; i++) { if (!seen[buf[i]]) { seen[buf[i]] = 1; unique++; } }
+        // Real protocol frames have 2–20 unique byte values; pure noise has many
+        if (unique >= 2 && unique <= 20) return true;
     }
+
     return false;
 }
 
-// ==================== 12. RS485 Sniffer FreeRTOS Task (Core 1) ====================
+
+// ==================== 12. Raw GPIO Sampler Task ====================
+// Edge-triggered: waits for falling edge on pin 44, then captures 60ms
+// at 100kHz (10µs/sample = ~10 samples per 104µs bit at 9600 baud).
+// Decodes each UART frame and reports which config (8N1/8E1/8O1/8N2...) fits.
+// Runs on Core 1. Pauses Serial1 during the 60ms capture window, then
+// signals the UART sniffer task to re-open Serial1.
+
+#define RAW_SAMPLE_RATE_US  10
+#define RAW_CAPTURE_MS      60
+#define RAW_MAX_SAMPLES     (RAW_CAPTURE_MS * 1000 / RAW_SAMPLE_RATE_US)  // 6000
+
+// Global buffers (not on task stack — 30KB total, fine in PSRAM-extended heap)
+static uint8_t  raw_buf[RAW_MAX_SAMPLES];   // 6 KB
+static uint32_t raw_ts[RAW_MAX_SAMPLES];    // 24 KB
+
+// Coordination: sampler pauses UART task during capture
+static volatile bool g_sampler_active = false;
+
+void TaskRawSampler(void *pvParameters) {
+    (void)pvParameters;
+    Serial.printf("[Raw] GPIO sampler on pin %d ready\n", RS485_RX_PIN);
+
+    for (;;) {
+        // ── 1. Wait for falling edge (start bit) with 3s timeout ─────────
+        pinMode(RS485_RX_PIN, INPUT);  // ensure GPIO mode while waiting
+        uint32_t wait_start = millis();
+        bool got_edge = false;
+        while (millis() - wait_start < 3000) {
+            if (digitalRead(RS485_RX_PIN) == LOW) { got_edge = true; break; }
+            taskYIELD();
+        }
+
+        if (!got_edge) {
+            Serial.println("[Raw] No edge in 3s. Check: A/B polarity? RE/DE pin grounded? Vcc?");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // ── 2. Signal UART task to stop (it will end Serial1) ────────────
+        g_sampler_active = true;
+        vTaskDelay(pdMS_TO_TICKS(5)); // let UART task notice and end Serial1
+
+        // Re-assert GPIO input (Serial1.end may have changed pin mode)
+        pinMode(RS485_RX_PIN, INPUT);
+
+        // ── 3. Capture 60ms at 100kHz ─────────────────────────────────────
+        int n = 0;
+        uint64_t t0     = esp_timer_get_time();
+        uint64_t t_next = t0;
+        while (n < RAW_MAX_SAMPLES) {
+            while ((int64_t)(esp_timer_get_time() - t_next) < 0) {}  // busy-wait
+            raw_buf[n] = (uint8_t)digitalRead(RS485_RX_PIN);
+            raw_ts[n]  = (uint32_t)(esp_timer_get_time() - t0);
+            t_next += RAW_SAMPLE_RATE_US;
+            n++;
+        }
+        g_sniffer.raw_captures++;
+        g_sampler_active = false;  // release UART task
+
+        // ── 4. Run-length encode for waveform printout ───────────────────
+        Serial.printf("\n=== RAW #%lu (pin%d, 100kHz, 60ms) ===\n",
+            (unsigned long)g_sniffer.raw_captures, RS485_RX_PIN);
+
+        uint8_t  prev = raw_buf[0];
+        int      run  = 1;
+        uint32_t min_run = 99999, max_run = 0, run_cnt = 0;
+        bool     any_low = false;
+        char     line[120]; int lpos = snprintf(line, sizeof(line), "  ");
+
+        for (int i = 1; i <= n; i++) {
+            bool flush = (i == n) || (raw_buf[i] != prev);
+            if (flush) {
+                uint32_t us = (uint32_t)run * RAW_SAMPLE_RATE_US;
+                if (run >= 3) {
+                    if (us < min_run) min_run = us;
+                    if (us > max_run) max_run = us;
+                    run_cnt++;
+                }
+                if (!prev) any_low = true;
+                lpos += snprintf(line+lpos, sizeof(line)-lpos, "%c%lu ", prev?'H':'L', (unsigned long)us);
+                if (lpos > 90) { Serial.println(line); lpos = snprintf(line, sizeof(line), "  "); }
+                if (i < n) { prev = raw_buf[i]; run = 1; }
+            } else { run++; }
+        }
+        if (lpos > 2) Serial.println(line);
+
+        if (!any_low) {
+            Serial.println("  *** Line stayed HIGH the entire 60ms ***");
+            Serial.println("  Possible causes:");
+            Serial.println("    1. RS485 A/B swapped — try swapping the two wires");
+            Serial.println("    2. RE/DE pin not pulled LOW (enable receive mode)");
+            Serial.println("    3. Pin 44 not connected to module RO pin");
+            g_sniffer.raw_bit_us = 0;
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // ── 5. Estimate bit period ────────────────────────────────────────
+        if (min_run <  50) min_run = 104;  // sub-50µs = glitch, floor at 9600 baud
+        if (min_run > 500) min_run = 104;  // >500µs = below 2000 baud, unexpected
+        g_sniffer.raw_bit_us = min_run;
+        uint32_t baud_est = 1000000UL / min_run;
+        Serial.printf("  bit=%luus  baud~%lu  runs=%lu  min=%luus  max=%luus\n",
+            (unsigned long)min_run, (unsigned long)baud_est,
+            (unsigned long)run_cnt, (unsigned long)min_run, (unsigned long)max_run);
+
+        // ── 6. Soft-decode UART frames ────────────────────────────────────
+        int  spb  = (int)(min_run / RAW_SAMPLE_RATE_US);  // samples per bit (~10)
+        if (spb < 1) spb = 1;
+        int  half = spb / 2;
+        int  frames = 0;
+        Serial.printf("  Frames (spb=%d):\n", spb);
+
+        for (int si = 1; si < n - spb * 13; si++) {
+            // Falling edge = start bit candidate
+            if (raw_buf[si-1] != 1 || raw_buf[si] != 0) continue;
+            // Verify start bit centre is LOW
+            if (si + half >= n || raw_buf[si + half] != 0) continue;
+
+            // Sample bits: positions relative to start edge
+            // bit slot k centre = si + half + k*spb
+            // k=0: start (verified above)
+            // k=1..8: data bits d0..d7
+            // k=9: either parity or stop1
+            // k=10: stop1 or stop2
+            uint16_t samp = 0;
+            bool ok = true;
+            for (int k = 1; k <= 11; k++) {
+                int idx = si + half + k * spb;
+                if (idx >= n) { ok = false; break; }
+                if (raw_buf[idx]) samp |= (1 << (k-1));
+            }
+            if (!ok) break;
+
+            uint8_t data = (uint8_t)(samp & 0xFF);          // bits k=1..8
+            uint8_t b8   = (samp >> 8)  & 1;                // k=9
+            uint8_t b9   = (samp >> 9)  & 1;                // k=10
+            uint8_t b10  = (samp >> 10) & 1;                // k=11
+
+            uint8_t ones = (uint8_t)__builtin_popcount(data);
+            // 8N1: b8 must be 1 (stop)
+            bool n1 = (b8 == 1);
+            // 8N2: b8 and b9 both 1
+            bool n2 = (b8 == 1 && b9 == 1);
+            // 8E1: (ones + b8) is even → b8 = ones%2
+            bool ep = (b8 == (ones & 1));
+            // 8O1: (ones + b8) is odd → b8 != ones%2
+            bool op = (b8 != (ones & 1));
+            // 8E2: even parity then stop → ep && b9==1
+            bool ep2 = (ep && b9 == 1);
+            // 8O2: odd parity then stop
+            bool op2 = (op && b9 == 1);
+
+            Serial.printf("    0x%02X '%c'  b8=%d b9=%d b10=%d | 8N1:%s 8N2:%s 8E1:%s 8E2:%s 8O1:%s 8O2:%s\n",
+                data, (data >= 0x20 && data < 0x7F) ? (char)data : '.',
+                b8, b9, b10,
+                n1 ?"OK":"--", n2 ?"OK":"--",
+                ep ?"OK":"--", ep2?"OK":"--",
+                op ?"OK":"--", op2?"OK":"--");
+
+            frames++;
+            si += spb * 10;  // skip rest of frame
+        }
+        if (frames == 0)
+            Serial.println("  (0 frames decoded — signal may be inverted or too noisy)");
+
+        Serial.printf("=== END RAW #%lu (%d frames) ===\n\n",
+            (unsigned long)g_sniffer.raw_captures, frames);
+
+        vTaskDelay(pdMS_TO_TICKS(200));  // brief pause before next trigger-wait
+    }
+}
+
+// ==================== 13. UART Sniffer Task ====================
+// Cycles through all 6 parity/stop combos at 9600 baud.
+// Suspends Serial1 while the raw sampler is capturing.
 #if ENABLE_RS485_SNIFFER
 void TaskRS485Sniffer(void *pvParameters) {
     (void)pvParameters;
 
-    // ── Self-test: TX known bytes via Serial2, receive on Serial1 ──────────
-#if RS485_SELF_TEST
-    // Serial1 = RX on pin 44, TX on pin 43 (sniffer UART, receive-only in production)
-    // Serial2 = TX on pin 43 only for self-test — wire pin 43 to pin 44 externally.
-    // Self-test runs at 9600 8N1 for simplicity.
-    Serial.println("[Sniffer] Self-test: begin (wire pin 43 → pin 44 for loopback)");
-    Serial2.begin(9600, SERIAL_8N1, -1, RS485_TX_PIN); // TX=43, no RX
-    Serial1.begin(9600, SERIAL_8N1, RS485_RX_PIN, -1); // RX=44, no TX
-    vTaskDelay(pdMS_TO_TICKS(100));
+    int      cfg_idx    = 0;
+    g_sniffer.cfg_idx   = cfg_idx;
+    bool     uart_open  = false;
 
-    // Transmit a known sequence
-    const uint8_t test_seq[] = {0xAA, 0x01, 0x02, 0x03, 0xAB};
-    Serial2.write(test_seq, sizeof(test_seq));
-    Serial2.flush();
-    vTaskDelay(pdMS_TO_TICKS(50));
+    auto open_uart = [&]() {
+        Serial1.begin(rs485_configs[cfg_idx].baud,
+                      rs485_configs[cfg_idx].serial_cfg,
+                      RS485_RX_PIN, -1);
+        uart_open = true;
+    };
+    auto close_uart = [&]() {
+        Serial1.end();
+        uart_open = false;
+    };
 
-    int matched = 0;
-    int test_idx = 0;
-    unsigned long t0 = millis();
-    while (millis() - t0 < 500) {
-        if (Serial1.available()) {
-            uint8_t b = Serial1.read();
-            if (test_idx < (int)sizeof(test_seq) && b == test_seq[test_idx]) {
-                test_idx++;
-                if (test_idx == (int)sizeof(test_seq)) { matched = 1; break; }
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    g_sniffer.self_test_ok = (matched == 1);
-    Serial.printf("[Sniffer] Self-test result: %s\n", g_sniffer.self_test_ok ? "PASS" : "FAIL (pin 43→44 not connected?)");
+    open_uart();
+    Serial.printf("[UART] Start: %s\n", rs485_configs[cfg_idx].desc);
 
-    Serial1.end();
-    Serial2.end();
-    vTaskDelay(pdMS_TO_TICKS(50));
-#endif // RS485_SELF_TEST
-
-    // ── Main sniff loop ────────────────────────────────────────────────────
-    int cfg_idx = 0;
-    g_sniffer.cfg_idx = cfg_idx;
-
-    Serial1.begin(rs485_configs[cfg_idx].baud,
-                  rs485_configs[cfg_idx].serial_cfg,
-                  RS485_RX_PIN, -1); // RX only, no TX
-    Serial.printf("[Sniffer] Start scanning: %s\n", rs485_configs[cfg_idx].desc);
-
-    // Per-slot state
-    uint32_t slot_bytes   = 0;
-    uint32_t slot_valid   = 0;
-    uint32_t slot_invalid = 0;
-
-    // Packet assembly buffer
-    static uint8_t pkt_buf[64];
+    uint32_t slot_bytes = 0, slot_valid = 0, slot_invalid = 0;
+    static uint8_t pkt_buf[128];
     int pkt_len = 0;
-    unsigned long last_byte_time = millis();
-    const uint32_t PKT_GAP_MS = 5; // silence > 5 ms = end of packet
-
-    unsigned long slot_start = millis();
+    unsigned long last_byte_ms = millis();
+    unsigned long slot_start   = millis();
 
     for (;;) {
-        // ── Read incoming bytes ────────────────────────────────────────────
-        if (Serial1.available()) {
-            uint8_t b = Serial1.read();
-            last_byte_time = millis();
-            slot_bytes++;
-            g_sniffer.bytes_total++;
-
-            // Print hex to Serial monitor
-            if (b < 0x10) Serial.print('0');
-            Serial.print(b, HEX);
-            Serial.print(' ');
-
-            if (pkt_len < (int)sizeof(pkt_buf)) {
-                pkt_buf[pkt_len++] = b;
-            }
+        // Yield pin to raw sampler when it's active
+        if (g_sampler_active) {
+            if (uart_open) close_uart();
+            while (g_sampler_active) vTaskDelay(pdMS_TO_TICKS(5));
+            open_uart();
         }
 
-        // ── Detect end of packet by silence gap ───────────────────────────
-        if (pkt_len > 0 && (millis() - last_byte_time) > PKT_GAP_MS) {
-            bool ok = validate_packet(pkt_buf, pkt_len);
-            if (ok) { slot_valid++;   g_sniffer.pkts_valid++;   }
-            else    { slot_invalid++; g_sniffer.pkts_invalid++; }
+        // Read bytes
+        while (Serial1.available()) {
+            uint8_t b = Serial1.read();
+            last_byte_ms = millis();
+            slot_bytes++;
+            g_sniffer.bytes_total++;
+            if (pkt_len == 0) Serial.printf("[%s] ", rs485_configs[cfg_idx].label);
+            Serial.printf("%02X ", b);
+            if (pkt_len < (int)sizeof(pkt_buf)) pkt_buf[pkt_len++] = b;
+        }
 
-            Serial.printf("\n[Sniffer] PKT len=%d %s\n", pkt_len, ok ? "VALID" : "invalid");
+        // Packet boundary on silence
+        if (pkt_len > 0 && (millis() - last_byte_ms) > PKT_GAP_MS) {
+            bool noise = is_framing_noise(pkt_buf, pkt_len);
+            bool ok    = !noise && validate_packet(pkt_buf, pkt_len);
+            if (!noise) {
+                if (ok) { slot_valid++;   g_sniffer.pkts_valid++;   }
+                else    { slot_invalid++; g_sniffer.pkts_invalid++; }
+                Serial.printf(" ← len=%d %s\n", pkt_len, ok ? "OK" : "inv");
+            }
             pkt_len = 0;
         }
 
-        // ── Advance to next config every SCAN_INTERVAL_MS ─────────────────
+        // Rotate config
         if (millis() - slot_start > SCAN_INTERVAL_MS) {
-            Serial.printf("\n[Sniffer] Slot done: %s | bytes=%lu valid=%lu invalid=%lu\n",
-                rs485_configs[cfg_idx].desc,
+            Serial.printf("[UART] %s done: B=%lu V=%lu I=%lu\n",
+                rs485_configs[cfg_idx].label,
                 (unsigned long)slot_bytes,
                 (unsigned long)slot_valid,
                 (unsigned long)slot_invalid);
-
             cfg_idx = (cfg_idx + 1) % RS485_NUM_CONFIGS;
-            g_sniffer.cfg_idx   = cfg_idx;
+            g_sniffer.cfg_idx = cfg_idx;
             g_sniffer.slots_scanned++;
-
-            // Reset per-slot counters
-            slot_bytes = slot_valid = slot_invalid = 0;
-            pkt_len = 0;
-
-            Serial1.end();
+            slot_bytes = slot_valid = slot_invalid = pkt_len = 0;
+            close_uart();
             vTaskDelay(pdMS_TO_TICKS(30));
-            Serial1.begin(rs485_configs[cfg_idx].baud,
-                          rs485_configs[cfg_idx].serial_cfg,
-                          RS485_RX_PIN, -1);
-            Serial.printf("[Sniffer] -> %s\n", rs485_configs[cfg_idx].desc);
+            open_uart();
+            Serial.printf("[UART] -> %s\n", rs485_configs[cfg_idx].desc);
             slot_start = millis();
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
-#endif // ENABLE_RS485_SNIFFER
+#endif
 
-// ==================== 13. setup() ====================
+// ==================== 14. setup() ====================
 void setup() {
     Serial.begin(115200);
-    Serial.println("=== AC Controller + RS485 Sniffer ===");
-    Serial.printf("[Config] RS485 RX=pin%d  TX=pin%d  configs=%d  self_test=%s\n",
-        RS485_RX_PIN, RS485_TX_PIN, RS485_NUM_CONFIGS,
-        RS485_SELF_TEST ? "ON (wire 43->44)" : "OFF");
+    Serial.println("=== AC Controller + RS485 Dual Sniffer ===");
+    Serial.printf("[Config] RX=pin%d  TX=pin%d\n", RS485_RX_PIN, RS485_TX_PIN);
+    Serial.println("[Config] Raw GPIO sampler: edge-triggered, 100kHz, 60ms window");
+    Serial.printf("[Config] UART scanner: 9600 baud x %d configs x %lus each\n",
+        RS485_NUM_CONFIGS, (unsigned long)(SCAN_INTERVAL_MS / 1000));
 
-    Serial.println("Initializing board");
     Board *board = new Board();
     board->init();
 
@@ -540,36 +697,24 @@ void setup() {
 #endif
 
     assert(board->begin());
-
-    Serial.println("Initializing LVGL");
     lvgl_port_init(board->getLCD(), board->getTouch());
 
-    Serial.println("Creating UI");
     lvgl_port_lock(-1);
     lv_obj_set_size(lv_scr_act(), lv_pct(100), lv_pct(100));
     create_air_con_dashboard();
     lvgl_port_unlock();
 
+    // Raw GPIO sampler — higher priority so it wins the pin during capture
+    xTaskCreatePinnedToCore(TaskRawSampler, "RawSampler", 8192, NULL, 5, NULL, 1);
+
 #if ENABLE_RS485_SNIFFER
-    xTaskCreatePinnedToCore(
-        TaskRS485Sniffer,
-        "RS485Sniffer",
-        6144,   // stack — slightly larger for loopback test buffers
-        NULL,
-        3,
-        NULL,
-        1       // Core 1 (LVGL runs on Core 0 via Arduino)
-    );
-    Serial.println("[System] RS485 sniffer task started on Core 1");
-#else
-    Serial.println("[System] RS485 sniffer disabled");
+    xTaskCreatePinnedToCore(TaskRS485Sniffer, "RS485Sniffer", 6144, NULL, 3, NULL, 1);
 #endif
 
     Serial.println("[System] Ready.");
 }
 
-// ==================== 14. loop() ====================
+// ==================== 15. loop() ====================
 void loop() {
-    // Everything is handled by FreeRTOS tasks and LVGL timer callbacks.
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
