@@ -33,8 +33,8 @@ struct BusACState {
     uint8_t  zone_mask;     // bits 0–4 = zones 1–5
     uint8_t  fan_speed;     // raw byte from bus
     uint8_t  mode;          // raw byte from bus
-    uint8_t  room_temp_raw; // divide by 10 for °C
-    uint8_t  setpoint;      // direct °C
+    uint16_t room_temp_raw; // byte[2], divide by 10 for °C
+    uint16_t setpoint;      // byte[8], divide by 10 for °C
     uint8_t  status_flag;   // 0x40=running, 0x00=idle
     // Time from bus (0x61 frame bytes 14-15)
     uint8_t  bus_hour;
@@ -199,18 +199,27 @@ static void sniffer_status_timer_cb(lv_timer_t *timer) {
         ac_current_mode = bus_mode_to_ui(s.mode);
         ac_current_fan  = bus_fan_to_ui(s.fan_speed);
 
-        // Setpoint: not yet decoded from 0x61 frame, leave ac_target_temp unchanged
-        // TODO: parse FC06 writes to 0x9C49 area to capture setpoint
+        // Setpoint from bus: byte[8] ÷ 10 = °C
+        int setpt = s.setpoint / 10;
+        if (setpt >= 16 && setpt <= 30) {
+            ac_target_temp = setpt;
+        }
 
         // Update zone states from bitmask
         for (int i = 0; i < 5; i++) {
             ac_zones[i] = (s.zone_mask >> i) & 0x01;
         }
 
-        // Update room temperature display
+        // Update room temperature + time display (combined label)
         if (label_room_temp) {
             float room_c = s.room_temp_raw / 10.0f;
-            lv_label_set_text_fmt(label_room_temp, "Room temp: %.1f\xC2\xB0" "C", room_c);
+            float set_c  = s.setpoint / 10.0f;
+            if (s.bus_hour <= 23 && s.bus_minute <= 59) {
+                lv_label_set_text_fmt(label_room_temp, "%02d:%02d  Room: %.1fC",
+                    s.bus_hour, s.bus_minute, room_c);
+            } else {
+                lv_label_set_text_fmt(label_room_temp, "--:--  Room: %.1fC", room_c);
+            }
         }
 
         // Update target temp display
@@ -220,11 +229,6 @@ static void sniffer_status_timer_cb(lv_timer_t *timer) {
 
         // Refresh all buttons/panels to reflect new state
         refresh_air_con_ui();
-
-        // Update bus time display
-        if (lbl_bus_time && s.bus_hour <= 23 && s.bus_minute <= 59) {
-            lv_label_set_text_fmt(lbl_bus_time, "%02d:%02d", s.bus_hour, s.bus_minute);
-        }
     }
 
     // ── Update sniffer packet counter bar ──
@@ -264,18 +268,15 @@ void create_air_con_dashboard(void) {
     lv_obj_add_event_cb(btn_power, power_btn_cb, LV_EVENT_CLICKED, NULL);
 
     // Room temp display
+    // Room temp + bus time on same line
     label_room_temp = lv_label_create(left_panel);
-    lv_label_set_text(label_room_temp, "Room temp: --.-\xC2\xB0" "C");
-    lv_obj_set_style_text_font(label_room_temp, UI_FONT_CN, 0);
+    lv_label_set_text(label_room_temp, "--:--  Room: --.-C");
+    lv_obj_set_style_text_font(label_room_temp, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(label_room_temp, COLOR_TEXT_MUTED, 0);
     lv_obj_align(label_room_temp, LV_ALIGN_CENTER, 0, lv_pct(-24));
 
-    // Bus time display (from 0x61 broadcast)
-    lbl_bus_time = lv_label_create(left_panel);
-    lv_label_set_text(lbl_bus_time, "--:--");
-    lv_obj_set_style_text_font(lbl_bus_time, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_bus_time, COLOR_TEXT_MUTED, 0);
-    lv_obj_align(lbl_bus_time, LV_ALIGN_CENTER, 0, lv_pct(-34));
+    // lbl_bus_time is not needed as separate label — we combine into label_room_temp
+    lbl_bus_time = NULL;
 
     // Target temp
     label_target_temp = lv_label_create(left_panel);
@@ -458,8 +459,8 @@ static void parse_status_broadcast(const uint8_t *buf, int len) {
     state.zone_mask     = (buf[18] != 0x00) ? (buf[18] & 0x1F) : (buf[4] & 0x1F);
     state.fan_speed     = buf[5];
     state.mode          = buf[6];
-    state.room_temp_raw = buf[8];
-    state.setpoint      = 0;                 // Not yet identified in 0x61 frame
+    state.room_temp_raw = buf[2];            // ÷10 = room temp °C (0xBE=190→19.0°C)
+    state.setpoint      = buf[8];            // ÷10 = setpoint °C (0xD2=210→21.0°C)
     state.status_flag   = buf[21];
     // Note: byte[14]=hour, byte[15]=minute (NOT setpoint)
     state.bus_hour      = buf[14];
@@ -469,14 +470,14 @@ static void parse_status_broadcast(const uint8_t *buf, int len) {
     g_bus_state = state;
     g_bus_state_dirty = true;
 
-    Serial.printf("[Parse] 0x61: pwr=%s zones=0x%02X fan=%d mode=%d room=%.1f°C flag=0x%02X b2=0x%02X\n",
+    Serial.printf("[Parse] 0x61: pwr=%s zones=0x%02X fan=%d mode=%d room=%.1fC set=%.1fC flag=0x%02X\n",
         state.power ? "ON" : "OFF",
         state.zone_mask,
         state.fan_speed,
         state.mode,
         state.room_temp_raw / 10.0f,
-        state.status_flag,
-        buf[2]);
+        state.setpoint / 10.0f,
+        state.status_flag);
 }
 
 // ==================== 12b. Parse FC06 Write Commands ====================
