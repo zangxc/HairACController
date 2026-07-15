@@ -36,6 +36,9 @@ struct BusACState {
     uint8_t  room_temp_raw; // divide by 10 for °C
     uint8_t  setpoint;      // direct °C
     uint8_t  status_flag;   // 0x40=running, 0x00=idle
+    // Time from bus (0x61 frame bytes 14-15)
+    uint8_t  bus_hour;
+    uint8_t  bus_minute;
 };
 static BusACState g_bus_state = {};
 static volatile bool g_bus_state_dirty = false;
@@ -59,6 +62,7 @@ lv_obj_t *btn_power;
 lv_obj_t *btn_zones[5];
 lv_obj_t *lbl_zones[5];
 lv_obj_t *lbl_sniffer_bar = NULL;  // status bar label (right panel, below zones)
+lv_obj_t *lbl_bus_time = NULL;     // bus time display
 
 const char* mode_names[] = {"COOL", "HEAT", "FAN ONLY", "DRY", "AUTO"};
 const char* fan_names[]  = {"LOW", "MEDIUM", "HIGH"};
@@ -216,6 +220,11 @@ static void sniffer_status_timer_cb(lv_timer_t *timer) {
 
         // Refresh all buttons/panels to reflect new state
         refresh_air_con_ui();
+
+        // Update bus time display
+        if (lbl_bus_time && s.bus_hour <= 23 && s.bus_minute <= 59) {
+            lv_label_set_text_fmt(lbl_bus_time, "%02d:%02d", s.bus_hour, s.bus_minute);
+        }
     }
 
     // ── Update sniffer packet counter bar ──
@@ -256,10 +265,17 @@ void create_air_con_dashboard(void) {
 
     // Room temp display
     label_room_temp = lv_label_create(left_panel);
-    lv_label_set_text(label_room_temp, "Room temp: 21.5\xC2\xB0" "C");
+    lv_label_set_text(label_room_temp, "Room temp: --.-\xC2\xB0" "C");
     lv_obj_set_style_text_font(label_room_temp, UI_FONT_CN, 0);
     lv_obj_set_style_text_color(label_room_temp, COLOR_TEXT_MUTED, 0);
     lv_obj_align(label_room_temp, LV_ALIGN_CENTER, 0, lv_pct(-24));
+
+    // Bus time display (from 0x61 broadcast)
+    lbl_bus_time = lv_label_create(left_panel);
+    lv_label_set_text(lbl_bus_time, "--:--");
+    lv_obj_set_style_text_font(lbl_bus_time, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_bus_time, COLOR_TEXT_MUTED, 0);
+    lv_obj_align(lbl_bus_time, LV_ALIGN_CENTER, 0, lv_pct(-34));
 
     // Target temp
     label_target_temp = lv_label_create(left_panel);
@@ -446,6 +462,8 @@ static void parse_status_broadcast(const uint8_t *buf, int len) {
     state.setpoint      = 0;                 // Not yet identified in 0x61 frame
     state.status_flag   = buf[21];
     // Note: byte[14]=hour, byte[15]=minute (NOT setpoint)
+    state.bus_hour      = buf[14];
+    state.bus_minute    = buf[15];
 
     // Atomic-ish write (single-core writer, no tearing on ESP32 for aligned structs)
     g_bus_state = state;
@@ -568,9 +586,25 @@ void TaskRS485Sniffer(void *pvParameters) {
                     if (pkt[0] == 0x02 && pkt[1] == 0x06 && pkt_len == 8) {
                         parse_fc06_write(pkt, pkt_len);
                     }
+                    // Also scan for FC06 writes merged in longer packets (request+response in same gap)
+                    // Look for pattern: 02 06 9C xx at any offset
+                    if (pkt_len > 8) {
+                        for (int i = 0; i <= pkt_len - 8; i++) {
+                            if (pkt[i] == 0x02 && pkt[i+1] == 0x06 && pkt[i+2] == 0x9C) {
+                                parse_fc06_write(pkt + i, 8);
+                            }
+                        }
+                    }
                 } else {
                     g_sniffer.pkts_invalid++;
                     Serial.printf(" [? len=%d]\n", pkt_len);
+                    // Scan invalid packets too — merged frames often fail checksum
+                    // but still contain valid FC06 writes
+                    for (int i = 0; i <= pkt_len - 8; i++) {
+                        if (pkt[i] == 0x02 && pkt[i+1] == 0x06 && pkt[i+2] == 0x9C) {
+                            parse_fc06_write(pkt + i, 8);
+                        }
+                    }
                 }
             }
             pkt_len = 0;
