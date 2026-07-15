@@ -42,7 +42,7 @@ static volatile bool g_bus_state_dirty = false;
 
 // ==================== 4. Central AC State ====================
 bool ac_master_power  = false;
-int  ac_target_temp   = 21;
+int  ac_target_temp   = 30;
 int  ac_current_mode  = 0;  // 0:Cool 1:Heat 2:Fan 3:Dry 4:Auto
 int  ac_current_fan   = 1;  // 0:Low  1:Med  2:High
 bool ac_zones[]       = {true, false, false, false, false};
