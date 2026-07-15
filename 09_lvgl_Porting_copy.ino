@@ -63,6 +63,13 @@ lv_obj_t *btn_zones[5];
 lv_obj_t *lbl_zones[5];
 lv_obj_t *lbl_sniffer_bar = NULL;  // status bar label (right panel, below zones)
 lv_obj_t *lbl_bus_time = NULL;     // bus time display
+lv_obj_t *lbl_tx_bar = NULL;       // TX status bar label
+lv_obj_t *btn_tx_toggle = NULL;    // TX enable toggle button
+lv_obj_t *lbl_tx_toggle = NULL;    // TX toggle label
+
+// ==================== 5b. TX State ====================
+static bool    g_tx_enabled = false;   // Transmission disabled by default
+static uint32_t g_tx_count = 0;        // Packets transmitted
 
 const char* mode_names[] = {"COOL", "HEAT", "FAN ONLY", "DRY", "AUTO"};
 const char* fan_names[]  = {"LOW", "MEDIUM", "HIGH"};
@@ -96,6 +103,7 @@ static void temp_btn_cb(lv_event_t *e) {
     if (ac_target_temp < 16) ac_target_temp = 16;
     lv_label_set_text_fmt(label_target_temp, "%d\xC2\xB0" "C", ac_target_temp);
     Serial.printf("[UI] Target temp -> %d°C\n", ac_target_temp);
+    send_ac_command();
 }
 
 static void zone_btn_cb(lv_event_t *e) {
@@ -104,6 +112,7 @@ static void zone_btn_cb(lv_event_t *e) {
     ac_zones[zone_idx] = !ac_zones[zone_idx];
     refresh_zone_button(zone_idx);
     Serial.printf("[UI] Zone %d -> %s\n", zone_idx + 1, ac_zones[zone_idx] ? "ON" : "OFF");
+    send_ac_command();
 }
 
 static void mode_btn_cb(lv_event_t *e) {
@@ -111,6 +120,7 @@ static void mode_btn_cb(lv_event_t *e) {
     ac_current_mode = (ac_current_mode + 1) % 5;
     refresh_air_con_ui();
     Serial.printf("[UI] Mode -> %s\n", mode_names[ac_current_mode]);
+    send_ac_command();
 }
 
 static void fan_btn_cb(lv_event_t *e) {
@@ -118,12 +128,14 @@ static void fan_btn_cb(lv_event_t *e) {
     ac_current_fan = (ac_current_fan + 1) % 3;
     refresh_air_con_ui();
     Serial.printf("[UI] Fan -> %s\n", fan_names[ac_current_fan]);
+    send_ac_command();
 }
 
 static void power_btn_cb(lv_event_t *e) {
     ac_master_power = !ac_master_power;
     refresh_air_con_ui();
     Serial.printf("[UI] Power -> %s\n", ac_master_power ? "ON" : "OFF");
+    send_ac_command();
 }
 
 // ==================== 7. Zone Button Visual Refresh ====================
@@ -242,6 +254,14 @@ static void sniffer_status_timer_cb(lv_timer_t *timer) {
         valid > 0   ? lv_palette_main(LV_PALETTE_GREEN)  :
         total > 0   ? lv_palette_main(LV_PALETTE_ORANGE) :
                       COLOR_TEXT_MUTED, 0);
+
+    // ── Update TX status bar ──
+    if (lbl_tx_bar) {
+        lv_label_set_text_fmt(lbl_tx_bar, "TX: %s | sent:%lu",
+            g_tx_enabled ? "READY" : "off", (unsigned long)g_tx_count);
+        lv_obj_set_style_text_color(lbl_tx_bar,
+            g_tx_enabled ? lv_palette_main(LV_PALETTE_RED) : COLOR_TEXT_MUTED, 0);
+    }
 }
 
 // ==================== 10. Main Dashboard UI Build ====================
@@ -372,6 +392,46 @@ void create_air_con_dashboard(void) {
     lv_obj_set_width(lbl_sniffer_bar, lv_pct(100));
     lv_label_set_text(lbl_sniffer_bar, "RS485 sniffer starting...");
     lv_obj_align(lbl_sniffer_bar, LV_ALIGN_LEFT_MID, 0, 0);
+
+    // ── TX Enable Toggle (left panel, bottom-center) ────────────────────────
+    btn_tx_toggle = lv_btn_create(left_panel);
+    lv_obj_set_size(btn_tx_toggle, lv_pct(86), lv_pct(8));
+    lv_obj_align(btn_tx_toggle, LV_ALIGN_BOTTOM_MID, 0, lv_pct(-1));
+    lv_obj_set_style_bg_color(btn_tx_toggle, COLOR_ZONE_DISABLED, 0);
+    lbl_tx_toggle = lv_label_create(btn_tx_toggle);
+    lv_obj_set_style_text_font(lbl_tx_toggle, &lv_font_montserrat_12, 0);
+    lv_label_set_text(lbl_tx_toggle, "TX: DISABLED");
+    lv_obj_set_style_text_color(lbl_tx_toggle, COLOR_TEXT_MUTED, 0);
+    lv_obj_center(lbl_tx_toggle);
+    lv_obj_add_event_cb(btn_tx_toggle, [](lv_event_t *e) {
+        g_tx_enabled = !g_tx_enabled;
+        if (g_tx_enabled) {
+            lv_obj_set_style_bg_color(btn_tx_toggle, lv_palette_main(LV_PALETTE_RED), 0);
+            lv_label_set_text(lbl_tx_toggle, "TX: ENABLED");
+            lv_obj_set_style_text_color(lbl_tx_toggle, lv_color_white(), 0);
+        } else {
+            lv_obj_set_style_bg_color(btn_tx_toggle, COLOR_ZONE_DISABLED, 0);
+            lv_label_set_text(lbl_tx_toggle, "TX: DISABLED");
+            lv_obj_set_style_text_color(lbl_tx_toggle, COLOR_TEXT_MUTED, 0);
+        }
+        Serial.printf("[UI] TX -> %s\n", g_tx_enabled ? "ENABLED" : "DISABLED");
+    }, LV_EVENT_CLICKED, NULL);
+
+    // ── TX Status Bar (right panel, below sniffer bar) ──────────────────────
+    lv_obj_t *tx_bar = lv_obj_create(right_panel);
+    lv_obj_set_size(tx_bar, lv_pct(90), lv_pct(7));
+    lv_obj_align(tx_bar, LV_ALIGN_TOP_MID, 0, lv_pct(93));
+    lv_obj_set_style_bg_color(tx_bar, COLOR_SNIFFER_BG, 0);
+    lv_obj_set_style_border_color(tx_bar, lv_palette_main(LV_PALETTE_BLUE_GREY), 0);
+    lv_obj_set_style_border_width(tx_bar, 1, 0);
+    lv_obj_set_style_radius(tx_bar, 6, 0);
+    lv_obj_set_style_pad_all(tx_bar, 4, 0);
+
+    lbl_tx_bar = lv_label_create(tx_bar);
+    lv_obj_set_style_text_font(lbl_tx_bar, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lbl_tx_bar, COLOR_TEXT_MUTED, 0);
+    lv_label_set_text(lbl_tx_bar, "TX: off | sent:0");
+    lv_obj_align(lbl_tx_bar, LV_ALIGN_LEFT_MID, 0, 0);
 
     // LVGL timer: refresh status bar every 500 ms from within the LVGL task
     lv_timer_create(sniffer_status_timer_cb, 500, NULL);
@@ -547,6 +607,118 @@ static int bus_mode_to_ui(uint8_t mode_byte) {
     }
 }
 
+// ==================== 12c. RS485 TX — Slave Controller Replacement ====================
+// Sends FC06 write commands onto the bus when TX is enabled.
+// The onboard RS485 transceiver has auto DE/RE — just write to Serial1.
+//
+// TODO/TEST:
+// - Verify that sending during bus idle (~900ms gap) doesn't collide with master
+// - Verify the indoor unit accepts writes from a second device on the bus
+// - Verify the full command sequence (power, damper, fan/mode, zones, enable) is correct
+// - The 26-byte slave echo may be needed for the master to recognize us — test without first
+// - Timing: the slave might need to wait for a specific window (after master's poll cycle)
+
+// Modbus CRC16 (standard polynomial 0xA001)
+static uint16_t modbus_crc16(const uint8_t *buf, int len) {
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x0001) { crc >>= 1; crc ^= 0xA001; }
+            else              { crc >>= 1; }
+        }
+    }
+    return crc;
+}
+
+// Send a single FC06 write: addr=0x02, FC=0x06, reg, value (+ CRC)
+// Returns true if TX is enabled and data was sent.
+static bool rs485_send_fc06(uint16_t reg, uint16_t value) {
+    if (!g_tx_enabled) return false;
+
+    uint8_t frame[8];
+    frame[0] = 0x02;              // slave address (indoor unit)
+    frame[1] = 0x06;              // function code: write single register
+    frame[2] = (reg >> 8) & 0xFF; // register high
+    frame[3] = reg & 0xFF;        // register low
+    frame[4] = (value >> 8) & 0xFF; // value high
+    frame[5] = value & 0xFF;      // value low
+    uint16_t crc = modbus_crc16(frame, 6);
+    frame[6] = crc & 0xFF;        // CRC low
+    frame[7] = (crc >> 8) & 0xFF; // CRC high
+
+    Serial1.write(frame, 8);
+    Serial1.flush();  // wait for TX to complete before releasing bus
+    g_tx_count++;
+
+    Serial.printf("[TX] FC06 reg=0x%04X val=0x%04X\n", reg, value);
+    return true;
+}
+
+// Send the full AC command sequence (mimics what the slave controller sends)
+// Call this after any UI change (power, zones, temp, mode, fan)
+static void send_ac_command(void) {
+    if (!g_tx_enabled) return;
+
+    // Build zone bitmask from current state
+    uint8_t zone_mask = 0;
+    if (ac_master_power) {
+        for (int i = 0; i < 5; i++) {
+            if (ac_zones[i]) zone_mask |= (1 << i);
+        }
+    } else {
+        zone_mask = 0xFF;  // power-off marker
+    }
+
+    // Map UI mode to bus mode byte
+    // UI: 0=Cool 1=Heat 2=Fan 3=Dry 4=Auto
+    // Bus: 0x03=Cool 0x02=Heat 0x04=Fan/Dry (tentative)
+    uint8_t mode_byte;
+    switch (ac_current_mode) {
+        case 0: mode_byte = 0x03; break; // Cool
+        case 1: mode_byte = 0x02; break; // Heat
+        case 2: mode_byte = 0x04; break; // Fan Only
+        case 3: mode_byte = 0x04; break; // Dry (same as fan? TODO: verify)
+        case 4: mode_byte = 0x03; break; // Auto (TODO: find correct byte)
+        default: mode_byte = 0x03; break;
+    }
+
+    // Map UI fan to bus fan byte (tentative, from protocol analysis)
+    // UI: 0=Low 1=Med 2=High
+    // Bus: 0x01=Low 0x03=Med 0x05=High
+    uint8_t fan_byte;
+    switch (ac_current_fan) {
+        case 0: fan_byte = 0x01; break;
+        case 1: fan_byte = 0x03; break;
+        case 2: fan_byte = 0x05; break;
+        default: fan_byte = 0x03; break;
+    }
+
+    // TODO: fan_byte and mode_byte are combined into register 0x9C4C
+    // From captures: 0x9C4C = 0x0048, 0x004C, 0x0050 seen
+    // For now use 0x004C as a safe default (observed during heat mode)
+    uint16_t fan_mode_reg = 0x004C;  // TODO: decode properly
+
+    // TODO: damper (0x9C4B) and zone enable (0x9C4D) values are not fully decoded
+    // Using observed values: damper=0x0058, enable=0x0060
+    uint16_t damper_reg = 0x0058;    // TODO: decode properly
+    uint16_t zone_enable_reg = 0x0060; // TODO: decode properly
+
+    // Send the full sequence with small gaps between frames
+    // Sequence observed from slave: zones, power, damper, fan/mode, zone_enable
+    rs485_send_fc06(0x9C49, zone_mask);
+    delay(20);  // inter-frame gap
+    rs485_send_fc06(0x9C4A, ac_master_power ? 0x0001 : 0x0000);
+    delay(20);
+    rs485_send_fc06(0x9C4B, damper_reg);
+    delay(20);
+    rs485_send_fc06(0x9C4C, fan_mode_reg);
+    delay(20);
+    rs485_send_fc06(0x9C4D, zone_enable_reg);
+
+    Serial.printf("[TX] Command sent: pwr=%d zones=0x%02X\n", ac_master_power, zone_mask);
+}
+
 // ==================== 13. RS485 Sniffer Task (Core 1) ====================
 // Locked to 9600 8N2 — confirmed by raw GPIO analysis.
 // Prints all packets to serial as hex + validity marker.
@@ -554,8 +726,8 @@ static int bus_mode_to_ui(uint8_t mode_byte) {
 void TaskRS485Sniffer(void *pvParameters) {
     (void)pvParameters;
 
-    Serial1.begin(RS485_BAUD, RS485_CONFIG, RS485_RX_PIN, -1);
-    Serial.printf("[Sniffer] 9600 8N2 on pin %d\n", RS485_RX_PIN);
+    Serial1.begin(RS485_BAUD, RS485_CONFIG, RS485_RX_PIN, RS485_TX_PIN);
+    Serial.printf("[Sniffer] 9600 8N2 RX=%d TX=%d\n", RS485_RX_PIN, RS485_TX_PIN);
 
     static uint8_t pkt[128];
     int pkt_len = 0;
