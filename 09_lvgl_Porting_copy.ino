@@ -212,13 +212,13 @@ static void sniffer_status_timer_cb(lv_timer_t *timer) {
 
         // Update room temperature + time display (combined label)
         if (label_room_temp) {
-            float room_c = s.room_temp_raw / 10.0f;
-            float set_c  = s.setpoint / 10.0f;
+            int room_whole = s.room_temp_raw / 10;
+            int room_frac  = s.room_temp_raw % 10;
             if (s.bus_hour <= 23 && s.bus_minute <= 59) {
-                lv_label_set_text_fmt(label_room_temp, "%02d:%02d  Room: %.1fC",
-                    s.bus_hour, s.bus_minute, room_c);
+                lv_label_set_text_fmt(label_room_temp, "%02d:%02d  Room: %d.%dC",
+                    s.bus_hour, s.bus_minute, room_whole, room_frac);
             } else {
-                lv_label_set_text_fmt(label_room_temp, "--:--  Room: %.1fC", room_c);
+                lv_label_set_text_fmt(label_room_temp, "--:--  Room: %d.%dC", room_whole, room_frac);
             }
         }
 
