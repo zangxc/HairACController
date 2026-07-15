@@ -41,8 +41,8 @@ static BusACState g_bus_state = {};
 static volatile bool g_bus_state_dirty = false;
 
 // ==================== 4. Central AC State ====================
-bool ac_master_power  = true;
-int  ac_target_temp   = 24;
+bool ac_master_power  = false;
+int  ac_target_temp   = 21;
 int  ac_current_mode  = 0;  // 0:Cool 1:Heat 2:Fan 3:Dry 4:Auto
 int  ac_current_fan   = 1;  // 0:Low  1:Med  2:High
 bool ac_zones[]       = {true, false, false, false, false};
@@ -195,10 +195,8 @@ static void sniffer_status_timer_cb(lv_timer_t *timer) {
         ac_current_mode = bus_mode_to_ui(s.mode);
         ac_current_fan  = bus_fan_to_ui(s.fan_speed);
 
-        // Only trust setpoint when AC is powered on
-        if (s.power && s.setpoint >= 16 && s.setpoint <= 30) {
-            ac_target_temp = s.setpoint;
-        }
+        // Setpoint: not yet decoded from 0x61 frame, leave ac_target_temp unchanged
+        // TODO: parse FC06 writes to 0x9C49 area to capture setpoint
 
         // Update zone states from bitmask
         for (int i = 0; i < 5; i++) {
@@ -438,26 +436,75 @@ static void parse_status_broadcast(const uint8_t *buf, int len) {
     // Verify Modbus CRC16 on the frame (bytes 0..24, CRC at 25-26)
     // We already validated the packet via validate_packet(), but double-check addr
     BusACState state;
-    state.power         = (buf[2] == 0xB0);  // 0xB0=ON; when OFF, byte[2] echoes room temp or is 0xAF
-    state.zone_mask     = buf[4] & 0x1F;     // only bits 0–4 are zones
+    state.power         = (buf[21] == 0x40); // 0x40=running/ON, 0x00=idle/OFF
+    // Zone bitmask: byte[18] echoes the 0x9C49 register write when AC is on
+    // byte[4] sometimes has zone info too but less reliable
+    state.zone_mask     = (buf[18] != 0x00) ? (buf[18] & 0x1F) : (buf[4] & 0x1F);
     state.fan_speed     = buf[5];
     state.mode          = buf[6];
     state.room_temp_raw = buf[8];
-    state.setpoint      = buf[17];           // TODO: verify offset when AC is ON with known setpoint
+    state.setpoint      = 0;                 // Not yet identified in 0x61 frame
     state.status_flag   = buf[21];
+    // Note: byte[14]=hour, byte[15]=minute (NOT setpoint)
 
     // Atomic-ish write (single-core writer, no tearing on ESP32 for aligned structs)
     g_bus_state = state;
     g_bus_state_dirty = true;
 
-    Serial.printf("[Parse] 0x61: pwr=%s zones=0x%02X fan=%d mode=%d room=%.1f°C set=%d°C flag=0x%02X\n",
+    Serial.printf("[Parse] 0x61: pwr=%s zones=0x%02X fan=%d mode=%d room=%.1f°C flag=0x%02X b2=0x%02X\n",
         state.power ? "ON" : "OFF",
         state.zone_mask,
         state.fan_speed,
         state.mode,
         state.room_temp_raw / 10.0f,
-        state.setpoint,
-        state.status_flag);
+        state.status_flag,
+        buf[2]);
+}
+
+// ==================== 12b. Parse FC06 Write Commands ====================
+// FC06 writes from master carry actual control values (power, zones, setpoint)
+// Format: [addr=02] [FC=06] [reg_H] [reg_L] [val_H] [val_L] [CRC_L] [CRC_H]
+static void parse_fc06_write(const uint8_t *buf, int len) {
+    if (len != 8) return;
+    if (buf[0] != 0x02 || buf[1] != 0x06) return;
+
+    uint16_t reg = ((uint16_t)buf[2] << 8) | buf[3];
+    uint16_t val = ((uint16_t)buf[4] << 8) | buf[5];
+
+    switch (reg) {
+        case 0x9C49:  // Zone bitmask
+            if (val != 0x00FF) {  // 0xFF = power-off marker, ignore
+                Serial.printf("[FC06] Zones=0x%04X (", val);
+                for (int i = 0; i < 5; i++) {
+                    if (val & (1 << i)) Serial.printf("Z%d ", i+1);
+                }
+                Serial.println(")");
+                // Update zones in bus state
+                g_bus_state.zone_mask = val & 0x1F;
+                g_bus_state_dirty = true;
+            }
+            break;
+        case 0x9C4A:  // Power on/off
+            Serial.printf("[FC06] Power=%s\n", val ? "ON" : "OFF");
+            g_bus_state.power = (val == 0x0001);
+            g_bus_state.status_flag = val ? 0x40 : 0x00;
+            g_bus_state_dirty = true;
+            break;
+        case 0x9C4B:  // Damper state
+            Serial.printf("[FC06] Damper=0x%04X\n", val);
+            break;
+        case 0x9C4C:  // Fan/mode config
+            Serial.printf("[FC06] FanMode=0x%04X\n", val);
+            break;
+        case 0x9C4D:  // Zone enable flags
+            Serial.printf("[FC06] ZoneEnable=0x%04X\n", val);
+            break;
+        default:
+            if ((reg & 0xFF00) == 0x9C00) {
+                Serial.printf("[FC06] Reg=0x%04X Val=0x%04X\n", reg, val);
+            }
+            break;
+    }
 }
 
 // Map bus fan byte to UI index: 0=Low, 1=Med, 2=High
@@ -516,6 +563,10 @@ void TaskRS485Sniffer(void *pvParameters) {
                     // Attempt to parse 0x61 status broadcasts
                     if (pkt[0] == 0x61 && pkt_len >= 27) {
                         parse_status_broadcast(pkt, pkt_len);
+                    }
+                    // Attempt to parse FC06 write commands (8 bytes, addr=0x02, FC=0x06)
+                    if (pkt[0] == 0x02 && pkt[1] == 0x06 && pkt_len == 8) {
+                        parse_fc06_write(pkt, pkt_len);
                     }
                 } else {
                     g_sniffer.pkts_invalid++;
