@@ -530,7 +530,8 @@ static void parse_status_broadcast(const uint8_t *buf, int len) {
     g_bus_state = state;
     g_bus_state_dirty = true;
 
-    Serial.printf("[Parse] 0x61: pwr=%s zones=0x%02X fan=%d mode=%d room=%.1fC set=%.1fC flag=0x%02X\n",
+    Serial.printf("[%lu][Parse] 0x61: pwr=%s zones=0x%02X fan=%d mode=%d room=%.1fC set=%.1fC flag=0x%02X\n",
+        millis(),
         state.power ? "ON" : "OFF",
         state.zone_mask,
         state.fan_speed,
@@ -540,8 +541,33 @@ static void parse_status_broadcast(const uint8_t *buf, int len) {
         state.status_flag);
 }
 
-// ==================== 12b. Parse FC06 Write Commands ====================
-// FC06 writes from master carry actual control values (power, zones, setpoint)
+// ==================== 12b. Register Change Tracker ====================
+// Tracks last-seen value for each register written via FC06.
+// Logs when any register value changes.
+#define REG_TRACK_COUNT 8
+static struct {
+    uint16_t reg;
+    uint16_t val;
+    bool     seen;
+} g_reg_track[REG_TRACK_COUNT] = {};
+
+static int reg_track_find_or_add(uint16_t reg) {
+    for (int i = 0; i < REG_TRACK_COUNT; i++) {
+        if (g_reg_track[i].seen && g_reg_track[i].reg == reg) return i;
+    }
+    // Add new
+    for (int i = 0; i < REG_TRACK_COUNT; i++) {
+        if (!g_reg_track[i].seen) {
+            g_reg_track[i].reg = reg;
+            g_reg_track[i].seen = true;
+            g_reg_track[i].val = 0xFFFF; // sentinel
+            return i;
+        }
+    }
+    return -1; // full
+}
+
+// FC06 writes from master carry actual control values
 // Format: [addr=02] [FC=06] [reg_H] [reg_L] [val_H] [val_L] [CRC_L] [CRC_H]
 static void parse_fc06_write(const uint8_t *buf, int len) {
     if (len != 8) return;
@@ -550,39 +576,28 @@ static void parse_fc06_write(const uint8_t *buf, int len) {
     uint16_t reg = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t val = ((uint16_t)buf[4] << 8) | buf[5];
 
-    switch (reg) {
-        case 0x9C49:  // Zone bitmask
-            if (val != 0x00FF) {  // 0xFF = power-off marker, ignore
-                Serial.printf("[FC06] Zones=0x%04X (", val);
-                for (int i = 0; i < 5; i++) {
-                    if (val & (1 << i)) Serial.printf("Z%d ", i+1);
-                }
-                Serial.println(")");
-                // Update zones in bus state
-                g_bus_state.zone_mask = val & 0x1F;
-                g_bus_state_dirty = true;
+    // Track register changes
+    int idx = reg_track_find_or_add(reg);
+    if (idx >= 0) {
+        uint16_t old_val = g_reg_track[idx].val;
+        if (old_val != val) {
+            if (old_val == 0xFFFF) {
+                Serial.printf("[%lu][REG] 0x%04X = 0x%04X (first)\n", millis(), reg, val);
+            } else {
+                Serial.printf("[%lu][REG] 0x%04X: 0x%04X -> 0x%04X\n", millis(), reg, old_val, val);
             }
-            break;
-        case 0x9C4A:  // Power on/off
-            Serial.printf("[FC06] Power=%s\n", val ? "ON" : "OFF");
-            g_bus_state.power = (val == 0x0001);
-            g_bus_state.status_flag = val ? 0x40 : 0x00;
-            g_bus_state_dirty = true;
-            break;
-        case 0x9C4B:  // Damper state
-            Serial.printf("[FC06] Damper=0x%04X\n", val);
-            break;
-        case 0x9C4C:  // Fan/mode config
-            Serial.printf("[FC06] FanMode=0x%04X\n", val);
-            break;
-        case 0x9C4D:  // Zone enable flags
-            Serial.printf("[FC06] ZoneEnable=0x%04X\n", val);
-            break;
-        default:
-            if ((reg & 0xFF00) == 0x9C00) {
-                Serial.printf("[FC06] Reg=0x%04X Val=0x%04X\n", reg, val);
-            }
-            break;
+            g_reg_track[idx].val = val;
+        }
+    }
+
+    // Update UI state from known registers
+    if (reg == 0x9C49 && val != 0x00FF) {
+        g_bus_state.zone_mask = val & 0x1F;
+        g_bus_state_dirty = true;
+    } else if (reg == 0x9C4A) {
+        g_bus_state.power = (val == 0x0001);
+        g_bus_state.status_flag = val ? 0x40 : 0x00;
+        g_bus_state_dirty = true;
     }
 }
 
@@ -738,7 +753,7 @@ void TaskRS485Sniffer(void *pvParameters) {
             uint8_t b = Serial1.read();
             last_byte_ms = millis();
             g_sniffer.bytes_total++;
-            if (pkt_len == 0) Serial.print("[PKT] ");
+            if (pkt_len == 0) Serial.printf("[%lu][PKT] ", millis());
             Serial.printf("%02X ", b);
             if (pkt_len < (int)sizeof(pkt)) pkt[pkt_len++] = b;
         }
