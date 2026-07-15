@@ -25,6 +25,21 @@ struct SnifferStatus {
 };
 static SnifferStatus g_sniffer = {};
 
+// ==================== 3. Parsed Bus State (sniffer task → LVGL timer) ====================
+// Written by sniffer task on Core 1, read by LVGL timer on Core 0.
+// The dirty flag signals the UI timer to copy and refresh.
+struct BusACState {
+    bool     power;         // true=ON, false=OFF
+    uint8_t  zone_mask;     // bits 0–4 = zones 1–5
+    uint8_t  fan_speed;     // raw byte from bus
+    uint8_t  mode;          // raw byte from bus
+    uint8_t  room_temp_raw; // divide by 10 for °C
+    uint8_t  setpoint;      // direct °C
+    uint8_t  status_flag;   // 0x40=running, 0x00=idle
+};
+static BusACState g_bus_state = {};
+static volatile bool g_bus_state_dirty = false;
+
 // ==================== 4. Central AC State ====================
 bool ac_master_power  = true;
 int  ac_target_temp   = 24;
@@ -166,6 +181,46 @@ static void refresh_air_con_ui(void) {
 // Called from the LVGL task every 500 ms — safe to update widgets here.
 static void sniffer_status_timer_cb(lv_timer_t *timer) {
     if (!lbl_sniffer_bar) return;
+
+    // ── Apply parsed bus state to UI if new data arrived ──
+    if (g_bus_state_dirty) {
+        g_bus_state_dirty = false;
+
+        // Copy struct (single writer on Core 1, safe on ESP32 with portENTER_CRITICAL not needed for byte-aligned POD)
+        BusACState s;
+        memcpy(&s, (const void *)&g_bus_state, sizeof(BusACState));
+
+        // Update global AC state variables
+        ac_master_power = s.power;
+        ac_current_mode = bus_mode_to_ui(s.mode);
+        ac_current_fan  = bus_fan_to_ui(s.fan_speed);
+
+        // Only trust setpoint when AC is powered on
+        if (s.power && s.setpoint >= 16 && s.setpoint <= 30) {
+            ac_target_temp = s.setpoint;
+        }
+
+        // Update zone states from bitmask
+        for (int i = 0; i < 5; i++) {
+            ac_zones[i] = (s.zone_mask >> i) & 0x01;
+        }
+
+        // Update room temperature display
+        if (label_room_temp) {
+            float room_c = s.room_temp_raw / 10.0f;
+            lv_label_set_text_fmt(label_room_temp, "Room temp: %.1f\xC2\xB0" "C", room_c);
+        }
+
+        // Update target temp display
+        if (label_target_temp) {
+            lv_label_set_text_fmt(label_target_temp, "%d\xC2\xB0" "C", ac_target_temp);
+        }
+
+        // Refresh all buttons/panels to reflect new state
+        refresh_air_con_ui();
+    }
+
+    // ── Update sniffer packet counter bar ──
     uint32_t valid   = g_sniffer.pkts_valid;
     uint32_t invalid = g_sniffer.pkts_invalid;
     uint32_t total   = g_sniffer.pkts_captured;
@@ -364,6 +419,68 @@ static bool validate_packet(const uint8_t *buf, int len) {
 
 
 
+// ==================== 12. Parse 0x61 Status Broadcast ====================
+// The indoor unit broadcasts a 27-byte status frame every ~1s.
+// Layout (from protocol_analysis.md):
+//   [0]  = 0x61 device addr
+//   [2]  = power: 0xB0=ON, 0xAF=OFF
+//   [4]  = zone/status flags (zone bitmask in low nibble)
+//   [5]  = fan speed: 0x01=low, 0x03=med, 0x04=auto, 0x05=high
+//   [6]  = mode: 0x02=Heat, 0x03=Cool, 0x04=Fan/Dry
+//   [8]  = room temp raw (÷10 = °C)
+//   [17] = setpoint (direct °C)
+//   [21] = status flag: 0x40=running
+//   [25–26] = CRC16
+static void parse_status_broadcast(const uint8_t *buf, int len) {
+    if (len < 27) return;       // too short for 0x61 frame
+    if (buf[0] != 0x61) return; // not a status broadcast
+
+    // Verify Modbus CRC16 on the frame (bytes 0..24, CRC at 25-26)
+    // We already validated the packet via validate_packet(), but double-check addr
+    BusACState state;
+    state.power         = (buf[2] == 0xB0);  // 0xB0=ON; when OFF, byte[2] echoes room temp or is 0xAF
+    state.zone_mask     = buf[4] & 0x1F;     // only bits 0–4 are zones
+    state.fan_speed     = buf[5];
+    state.mode          = buf[6];
+    state.room_temp_raw = buf[8];
+    state.setpoint      = buf[17];           // TODO: verify offset when AC is ON with known setpoint
+    state.status_flag   = buf[21];
+
+    // Atomic-ish write (single-core writer, no tearing on ESP32 for aligned structs)
+    g_bus_state = state;
+    g_bus_state_dirty = true;
+
+    Serial.printf("[Parse] 0x61: pwr=%s zones=0x%02X fan=%d mode=%d room=%.1f°C set=%d°C flag=0x%02X\n",
+        state.power ? "ON" : "OFF",
+        state.zone_mask,
+        state.fan_speed,
+        state.mode,
+        state.room_temp_raw / 10.0f,
+        state.setpoint,
+        state.status_flag);
+}
+
+// Map bus fan byte to UI index: 0=Low, 1=Med, 2=High
+static int bus_fan_to_ui(uint8_t fan_byte) {
+    switch (fan_byte) {
+        case 0x01: return 0; // Low
+        case 0x03: return 1; // Med
+        case 0x05: return 2; // High
+        case 0x04: return 1; // Auto → show as Med
+        default:   return 1; // unknown → Med
+    }
+}
+
+// Map bus mode byte to UI index: 0=Cool, 1=Heat, 2=Fan, 3=Dry, 4=Auto
+static int bus_mode_to_ui(uint8_t mode_byte) {
+    switch (mode_byte) {
+        case 0x03: return 0; // Cool
+        case 0x02: return 1; // Heat
+        case 0x04: return 2; // Fan Only (or Dry — same byte per analysis)
+        default:   return 0; // unknown → Cool
+    }
+}
+
 // ==================== 13. RS485 Sniffer Task (Core 1) ====================
 // Locked to 9600 8N2 — confirmed by raw GPIO analysis.
 // Prints all packets to serial as hex + validity marker.
@@ -393,8 +510,17 @@ void TaskRS485Sniffer(void *pvParameters) {
             bool ok    = !noise && validate_packet(pkt, pkt_len);
             if (!noise) {
                 g_sniffer.pkts_captured++;
-                if (ok) { g_sniffer.pkts_valid++;   Serial.printf(" [V len=%d]\n", pkt_len); }
-                else    { g_sniffer.pkts_invalid++;  Serial.printf(" [? len=%d]\n", pkt_len); }
+                if (ok) {
+                    g_sniffer.pkts_valid++;
+                    Serial.printf(" [V len=%d]\n", pkt_len);
+                    // Attempt to parse 0x61 status broadcasts
+                    if (pkt[0] == 0x61 && pkt_len >= 27) {
+                        parse_status_broadcast(pkt, pkt_len);
+                    }
+                } else {
+                    g_sniffer.pkts_invalid++;
+                    Serial.printf(" [? len=%d]\n", pkt_len);
+                }
             }
             pkt_len = 0;
         }
