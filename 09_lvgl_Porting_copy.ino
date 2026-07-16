@@ -112,7 +112,7 @@ static void zone_btn_cb(lv_event_t *e) {
     ac_zones[zone_idx] = !ac_zones[zone_idx];
     refresh_zone_button(zone_idx);
     Serial.printf("[UI] Zone %d -> %s\n", zone_idx + 1, ac_zones[zone_idx] ? "ON" : "OFF");
-    send_ac_command();
+    send_zone_update();
 }
 
 static void mode_btn_cb(lv_event_t *e) {
@@ -135,7 +135,7 @@ static void power_btn_cb(lv_event_t *e) {
     ac_master_power = !ac_master_power;
     refresh_air_con_ui();
     Serial.printf("[UI] Power -> %s\n", ac_master_power ? "ON" : "OFF");
-    send_ac_command();
+    send_full_ac_command();
 }
 
 // ==================== 7. Zone Button Visual Refresh ====================
@@ -670,12 +670,11 @@ static bool rs485_send_fc06(uint16_t reg, uint16_t value) {
     return true;
 }
 
-// Send the full AC command sequence (mimics what the slave controller sends)
-// Call this after any UI change (power, zones, temp, mode, fan)
-static void send_ac_command(void) {
+// Send the full AC command sequence (power on/off)
+// Only call on power state change — sends all 5 registers
+static void send_full_ac_command(void) {
     if (!g_tx_enabled) return;
 
-    // Build zone bitmask from current state
     uint8_t zone_mask = 0;
     if (ac_master_power) {
         for (int i = 0; i < 5; i++) {
@@ -685,44 +684,13 @@ static void send_ac_command(void) {
         zone_mask = 0xFF;  // power-off marker
     }
 
-    // Map UI mode to bus mode byte
-    // UI: 0=Cool 1=Heat 2=Fan 3=Dry 4=Auto
-    // Bus: 0x03=Cool 0x02=Heat 0x04=Fan/Dry (tentative)
-    uint8_t mode_byte;
-    switch (ac_current_mode) {
-        case 0: mode_byte = 0x03; break; // Cool
-        case 1: mode_byte = 0x02; break; // Heat
-        case 2: mode_byte = 0x04; break; // Fan Only
-        case 3: mode_byte = 0x04; break; // Dry (same as fan? TODO: verify)
-        case 4: mode_byte = 0x03; break; // Auto (TODO: find correct byte)
-        default: mode_byte = 0x03; break;
-    }
+    // TODO: these values are hardcoded from a single capture — decode properly
+    uint16_t fan_mode_reg = 0x004C;
+    uint16_t damper_reg = 0x0058;
+    uint16_t zone_enable_reg = 0x0060;
 
-    // Map UI fan to bus fan byte (tentative, from protocol analysis)
-    // UI: 0=Low 1=Med 2=High
-    // Bus: 0x01=Low 0x03=Med 0x05=High
-    uint8_t fan_byte;
-    switch (ac_current_fan) {
-        case 0: fan_byte = 0x01; break;
-        case 1: fan_byte = 0x03; break;
-        case 2: fan_byte = 0x05; break;
-        default: fan_byte = 0x03; break;
-    }
-
-    // TODO: fan_byte and mode_byte are combined into register 0x9C4C
-    // From captures: 0x9C4C = 0x0048, 0x004C, 0x0050 seen
-    // For now use 0x004C as a safe default (observed during heat mode)
-    uint16_t fan_mode_reg = 0x004C;  // TODO: decode properly
-
-    // TODO: damper (0x9C4B) and zone enable (0x9C4D) values are not fully decoded
-    // Using observed values: damper=0x0058, enable=0x0060
-    uint16_t damper_reg = 0x0058;    // TODO: decode properly
-    uint16_t zone_enable_reg = 0x0060; // TODO: decode properly
-
-    // Send the full sequence with small gaps between frames
-    // Sequence observed from slave: zones, power, damper, fan/mode, zone_enable
     rs485_send_fc06(0x9C49, zone_mask);
-    delay(20);  // inter-frame gap
+    delay(20);
     rs485_send_fc06(0x9C4A, ac_master_power ? 0x0001 : 0x0000);
     delay(20);
     rs485_send_fc06(0x9C4B, damper_reg);
@@ -731,7 +699,67 @@ static void send_ac_command(void) {
     delay(20);
     rs485_send_fc06(0x9C4D, zone_enable_reg);
 
-    Serial.printf("[TX] Command sent: pwr=%d zones=0x%02X\n", ac_master_power, zone_mask);
+    Serial.printf("[%lu][TX] Full command: pwr=%d zones=0x%02X\n", millis(), ac_master_power, zone_mask);
+}
+
+// Send only zone bitmask update (for zone toggle)
+static void send_zone_update(void) {
+    if (!g_tx_enabled) return;
+    uint8_t zone_mask = 0;
+    for (int i = 0; i < 5; i++) {
+        if (ac_zones[i]) zone_mask |= (1 << i);
+    }
+    rs485_send_fc06(0x9C49, zone_mask);
+    Serial.printf("[%lu][TX] Zone update: 0x%02X\n", millis(), zone_mask);
+}
+
+// ==================== 12d. Slave Echo (26-byte 0x61 variant) ====================
+// The slave controller sends a 26-byte status echo every ~1s.
+// From captures: 61 00 00 00 [status] [fan] [mode] 00 [setpoint] ...
+// When TX enabled, we replicate this periodic echo.
+// TODO: verify exact content needed — built from last-known bus state
+static void send_slave_echo(void) {
+    if (!g_tx_enabled) return;
+
+    uint8_t frame[26];
+    memset(frame, 0, sizeof(frame));
+    frame[0] = 0x61;
+    // frame[1] = 0x00 (slave echo always 0x00 here)
+    // frame[2] = 0x00 (slave echo always 0x00, unlike indoor unit's room temp)
+    // frame[3] = 0x00
+    frame[4] = g_bus_state.status_flag;  // 0x40 when running, 0x00 when off
+    frame[5] = g_bus_state.fan_speed;
+    frame[6] = g_bus_state.mode;
+    // frame[7] = 0x00
+    frame[8] = g_bus_state.setpoint & 0xFF;
+    frame[9]  = 0x07;
+    frame[10] = 0xB4;
+    frame[11] = 0x1A;
+    frame[12] = 0x07;
+    frame[13] = 0x0F;
+    frame[14] = g_bus_state.bus_hour;
+    frame[15] = g_bus_state.bus_minute;
+    frame[16] = 0x03;
+    frame[17] = 0x0D;
+    frame[18] = g_bus_state.zone_mask;
+    // frame[19] = 0x00
+    // frame[20] = 0x00
+    frame[21] = g_bus_state.status_flag;
+    frame[22] = 0x1E;
+    frame[23] = 0x10;
+    // CRC16 over bytes 0..23
+    uint16_t crc = modbus_crc16(frame, 24);
+    frame[24] = crc & 0xFF;
+    frame[25] = (crc >> 8) & 0xFF;
+
+    Serial1.write(frame, 26);
+    Serial1.flush();
+    g_tx_count++;
+}
+
+// Wrapper: called from old UI callbacks that used send_ac_command()
+static void send_ac_command(void) {
+    send_full_ac_command();
 }
 
 // ==================== 13. RS485 Sniffer Task (Core 1) ====================
@@ -797,6 +825,14 @@ void TaskRS485Sniffer(void *pvParameters) {
             }
             pkt_len = 0;
         }
+
+        // Periodic slave echo (~1s) when TX enabled
+        static unsigned long last_echo_ms = 0;
+        if (g_tx_enabled && (millis() - last_echo_ms) > 1000) {
+            last_echo_ms = millis();
+            send_slave_echo();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
